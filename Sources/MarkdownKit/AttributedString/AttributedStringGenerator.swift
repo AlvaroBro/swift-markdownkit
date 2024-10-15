@@ -45,8 +45,6 @@ open class AttributedStringGenerator {
 
     open override func generate(block: Block, tight: Bool = false) -> String {
       switch block {
-        case .list(_, _, _):
-          return super.generate(block: block, tight: tight) + "<p style=\"margin: 0;\" />\n"
         case .indentedCode(_),
              .fencedCode(_, _):
           return "<table style=\"width: 100%; margin-bottom: 3px;\"><tbody><tr>" +
