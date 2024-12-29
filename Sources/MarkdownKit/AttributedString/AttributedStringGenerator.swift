@@ -258,9 +258,20 @@ open class AttributedStringGenerator {
   private func generateAttributedString(_ htmlBody: String) -> NSAttributedString? {
     let htmlDoc = self.generateHtml(htmlBody)
     let httpData = Data(htmlDoc.utf8)
+      
+    var attributedOptions: [NSAttributedString.DocumentReadingOptionKey: Any] = [:]
+
+    if #available(iOS 18.0, *) {
+        attributedOptions = [.documentType: NSAttributedString.DocumentType.html,
+                             .characterEncoding: String.Encoding.utf8.rawValue,
+                             .textKit1ListMarkerFormatDocumentOption: true]
+    } else {
+        attributedOptions = [.documentType: NSAttributedString.DocumentType.html,
+                             .characterEncoding: String.Encoding.utf8.rawValue]
+    }
+
     return try? NSAttributedString(data: httpData,
-                                   options: [.documentType: NSAttributedString.DocumentType.html,
-                                             .characterEncoding: String.Encoding.utf8.rawValue],
+                                   options: attributedOptions,
                                    documentAttributes: nil)
   }
   
