@@ -502,7 +502,13 @@ open class AttributedStringGenerator {
       }
       return nil
     case .zMarkupParser:
-      return self.zHTMLParser.render(htmlBody)
+      // Strip tags that WebKit interprets silently but ZMarkupParser renders as visible text.
+      let stripped = htmlBody
+        .replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>", with: "", options: [.regularExpression, .caseInsensitive])
+        .replacingOccurrences(of: "<head[^>]*>[\\s\\S]*?</head>", with: "", options: [.regularExpression, .caseInsensitive])
+        .replacingOccurrences(of: "</?html[^>]*>", with: "", options: [.regularExpression, .caseInsensitive])
+        .replacingOccurrences(of: "</?body[^>]*>", with: "", options: [.regularExpression, .caseInsensitive])
+      return self.zHTMLParser.render(stripped)
     }
   }
   
