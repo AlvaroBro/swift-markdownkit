@@ -23,6 +23,7 @@
 #elseif os(macOS)
   import Cocoa
 #endif
+import ZMarkupParser
 
 #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
 
@@ -56,13 +57,21 @@ open class AttributedStringGenerator {
 
     open override func generate(block: Block, parent: Parent, tight: Bool = false) -> String {
       switch block {
-        case .list(_, _, _):
-          let res = super.generate(block: block, parent: .block(block, parent), tight: tight)
-          if case .block(.listItem(_, _, _), _) = parent {
-            return res
+        case .list(let start, let tight, let blocks):
+          let isNested = { () -> Bool in
+            if case .block(.listItem(_, _, _), _) = parent { return true }
+            return false
+          }()
+          let listContent = self.generate(blocks: blocks, parent: .block(block, parent), tight: tight)
+          let res: String
+          if let startNumber = start {
+            res = "<ol start=\"\(startNumber)\">\n" + listContent + "</ol>\n"
+          } else if isNested {
+            res = "<ul style=\"list-style-type: circle\">\n" + listContent + "</ul>\n"
           } else {
-            return res + "<p style=\"margin: 0;\" />\n"
+            res = "<ul>\n" + listContent + "</ul>\n"
           }
+          return isNested ? res : res + "<p style=\"margin: 0;\" />\n"
         case .paragraph(let text):
           if case .block(.listItem(_, _, _), .block(.list(_, let tight, _), _)) = parent,
              tight || self.outer.options.contains(.tightLists) {
@@ -77,10 +86,9 @@ open class AttributedStringGenerator {
                  super.generate(block: block, parent: .block(block, parent), tight: tight) +
                  "</td></tr></tbody></table><p style=\"margin: 0;\" />\n"
         case .blockquote(let blocks):
-          return "<table class=\"blockquote\"><tbody><tr>" +
-                 "<td class=\"quote\" /><td style=\"width: 0.5em;\" /><td>\n" +
+          return "<blockquote>\n" +
                  self.generate(blocks: blocks, parent: .block(block, parent)) +
-                 "</td></tr><tr style=\"height: 0;\"><td /><td /><td /></tr></tbody></table>\n"
+                 "</blockquote>\n"
         case .thematicBreak:
           return "<p><table style=\"width: 100%; margin-bottom: 3px;\"><tbody>" +
                  "<tr><td class=\"thematic\"></td></tr></tbody></table></p>\n"
@@ -164,9 +172,24 @@ open class AttributedStringGenerator {
     }
   }
 
+  /// HTML to NSAttributedString rendering backend.
+  public enum HTMLRenderer {
+    /// Uses NSAttributedString(data:options:.html) which internally calls WebKit.
+    /// WARNING: Spins a nested run loop via NSHTMLReader._loadUsingWebKit, which can
+    /// cause reentrancy crashes in UITableView._updateVisibleCellsNow:.
+    /// Not safe to use during cell configuration in UITableView.
+    case webKit
+
+    /// Uses ZMarkupParser (pure Swift, synchronous, no WebKit, no run loop issues).
+    case zMarkupParser
+  }
+
   /// Default `AttributedStringGenerator` implementation.
   public static let standard: AttributedStringGenerator = AttributedStringGenerator()
-  
+
+  /// The HTML rendering backend.
+  public let htmlRenderer: HTMLRenderer
+
   /// The generator options.
   public let options: Options
   
@@ -229,7 +252,8 @@ open class AttributedStringGenerator {
   
   
   /// Constructor providing customization options for the generated `NSAttributedString` markup.
-  public init(options: Options = [],
+  public init(htmlRenderer: HTMLRenderer = .zMarkupParser,
+              options: Options = [],
               fontSize: Float = 14.0,
               fontFamily: String = "\"Times New Roman\",Times,serif",
               fontColor: String = mdDefaultColor,
@@ -250,6 +274,7 @@ open class AttributedStringGenerator {
               maxImageHeight: String? = nil,
               customStyle: String = "",
               imageBaseUrl: URL? = nil) {
+    self.htmlRenderer = htmlRenderer
     self.options = options
     self.fontSize = fontSize
     self.fontFamily = fontFamily
@@ -287,22 +312,197 @@ open class AttributedStringGenerator {
     return self.generateAttributedString(self.htmlGenerator.generate(blocks: blocks, parent: .none))
   }
   
+  // MARK: - ZMarkupParser (replacement for NSAttributedString HTML/WebKit)
+
+  private lazy var zHTMLParser: ZHTMLParser = {
+    return self.buildZHTMLParser()
+  }()
+
+  private func parseFontFamilyNames(_ cssFontFamily: String) -> [String] {
+    return cssFontFamily
+      .components(separatedBy: ",")
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
+      .filter { !$0.isEmpty && $0 != "serif" && $0 != "sans-serif" && $0 != "monospace" }
+  }
+
+  private func buildZHTMLParser() -> ZHTMLParser {
+    let baseFontNames = parseFontFamilyNames(self.fontFamily)
+    let codeFontNames = parseFontFamilyNames(self.codeFontFamily)
+
+    // Factor de conversión CSS px → iOS points, derivado empíricamente comparando
+    // la salida de WebKit con ZMarkupParser (WebKit body 19pt para fontSize 21px → 0.905)
+    let pxToPoints: CGFloat = 0.905
+    let basePt = CGFloat(self.fontSize) * pxToPoints
+    let codePt = CGFloat(self.codeFontSize) * pxToPoints
+    let codeBlockPt = CGFloat(self.codeBlockFontSize) * pxToPoints
+    let h1Pt = CGFloat(self.fontSize + 6) * pxToPoints
+    let h2Pt = CGFloat(self.fontSize + 4) * pxToPoints
+    let h3Pt = CGFloat(self.fontSize + 2) * pxToPoints
+    let h4Pt = CGFloat(self.fontSize + 1) * pxToPoints
+
+    let rootStyle = MarkupStyle(
+      font: MarkupStyleFont(
+        size: basePt,
+        familyName: baseFontNames.isEmpty ? nil : .familyNames(baseFontNames)
+      ),
+      paragraphStyle: MarkupStyleParagraphStyle(
+        paragraphSpacing: basePt * 0.7  // CSS: p { margin: 0.7em 0 }
+      ),
+      foregroundColor: MarkupStyleColor(string: self.fontColor)
+    )
+
+    var builder = ZHTMLParserBuilder.initWithDefault()
+      .set(rootStyle: rootStyle)
+      .set(policy: .respectMarkupStyleFromHTMLStyleAttribute)
+
+    // Headings — sizes and spacing match CSS margins in em units
+    builder = builder
+      .set(H1_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: h1Pt, weight: .style(.bold),
+                               familyName: baseFontNames.isEmpty ? nil : .familyNames(baseFontNames)),
+        paragraphStyle: MarkupStyleParagraphStyle(paragraphSpacing: h1Pt * 0.5, paragraphSpacingBefore: h1Pt * 0.7),
+        foregroundColor: MarkupStyleColor(string: self.h1Color)
+      ))
+      .set(H2_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: h2Pt, weight: .style(.bold),
+                               familyName: baseFontNames.isEmpty ? nil : .familyNames(baseFontNames)),
+        paragraphStyle: MarkupStyleParagraphStyle(paragraphSpacing: h2Pt * 0.4, paragraphSpacingBefore: h2Pt * 0.6),
+        foregroundColor: MarkupStyleColor(string: self.h2Color)
+      ))
+      .set(H3_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: h3Pt, weight: .style(.bold),
+                               familyName: baseFontNames.isEmpty ? nil : .familyNames(baseFontNames)),
+        paragraphStyle: MarkupStyleParagraphStyle(paragraphSpacing: h3Pt * 0.3, paragraphSpacingBefore: h3Pt * 0.5),
+        foregroundColor: MarkupStyleColor(string: self.h3Color)
+      ))
+      .set(H4_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: h4Pt, weight: .style(.bold),
+                               familyName: baseFontNames.isEmpty ? nil : .familyNames(baseFontNames)),
+        paragraphStyle: MarkupStyleParagraphStyle(paragraphSpacing: h4Pt * 0.2, paragraphSpacingBefore: h4Pt * 0.4),
+        foregroundColor: MarkupStyleColor(string: self.h4Color)
+      ))
+
+    // Inline formatting
+    builder = builder
+      .set(STRONG_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(weight: .style(.bold),
+                               familyName: .familyNames(["Helvetica Neue Bold"]))
+      ))
+      .set(EM_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(italic: true,
+                               familyName: .familyNames(["Helvetica Neue Italic"]))
+      ))
+      .set(A_HTMLTagName(), withCustomStyle: MarkupStyle(
+        foregroundColor: MarkupStyleColor(string: "#0000FF"),
+        underlineStyle: .single
+      ))
+
+    // Code
+    builder = builder
+      .set(CODE_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: codePt,
+                               familyName: codeFontNames.isEmpty ? nil : .familyNames(codeFontNames)),
+        foregroundColor: MarkupStyleColor(string: self.codeFontColor),
+        backgroundColor: MarkupStyleColor(string: self.codeBlockBackground)
+      ))
+      .set(PRE_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: codeBlockPt,
+                               familyName: codeFontNames.isEmpty ? nil : .familyNames(codeFontNames)),
+        foregroundColor: MarkupStyleColor(string: self.codeBlockFontColor),
+        backgroundColor: MarkupStyleColor(string: self.codeBlockBackground)
+      ))
+
+    // Blockquote
+    builder = builder
+      .set(BLOCKQUOTE_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(italic: true,
+                               familyName: .familyNames(["Helvetica Neue Italic"])),
+        paragraphStyle: MarkupStyleParagraphStyle(headIndent: 16, firstLineHeadIndent: 16),
+        foregroundColor: MarkupStyleColor(string: self.blockquoteColor)
+      ))
+
+    // Lists — match WebKit: small headIndent, compact spacing
+    builder = builder
+      .set(UL_HTMLTagName(), withCustomStyle: MarkupStyle(
+        paragraphStyle: MarkupStyleParagraphStyle(
+          paragraphSpacing: basePt * 0.1,
+          headIndent: 5,
+          textListStyleType: .disc,
+          textListHeadIndent: 5
+        )
+      ))
+      .set(OL_HTMLTagName(), withCustomStyle: MarkupStyle(
+        paragraphStyle: MarkupStyleParagraphStyle(
+          paragraphSpacing: basePt * 0.1,
+          headIndent: 5,
+          textListStyleType: .decimal,
+          textListHeadIndent: 5
+        )
+      ))
+      .set(LI_HTMLTagName(), withCustomStyle: MarkupStyle(
+        paragraphStyle: MarkupStyleParagraphStyle(
+          paragraphSpacing: basePt * 0.1
+        )
+      ))
+
+    // Table
+    builder = builder
+      .set(TABLE_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(size: basePt)
+      ))
+      .set(TH_HTMLTagName(), withCustomStyle: MarkupStyle(
+        font: MarkupStyleFont(weight: .style(.bold))
+      ))
+
+    // Definition lists (not natively supported — register as custom tags)
+    builder = builder
+      .add(ExtendTagName("dl"), withCustomStyle: nil)
+      .add(ExtendTagName("dt"), withCustomStyle: MarkupStyle(font: MarkupStyleFont(weight: .style(.bold))))
+      .add(ExtendTagName("dd"), withCustomStyle: MarkupStyle(
+        paragraphStyle: MarkupStyleParagraphStyle(headIndent: 20, firstLineHeadIndent: 20)
+      ))
+      .add(ExtendTagName("thead"), withCustomStyle: nil)
+      .add(ExtendTagName("tbody"), withCustomStyle: nil)
+
+    // CSS class styles
+    builder = builder
+      .add(HTMLTagClassAttribute(className: "codebox") {
+        MarkupStyle(backgroundColor: MarkupStyleColor(string: self.codeBlockBackground))
+      })
+      .add(HTMLTagClassAttribute(className: "quote") {
+        MarkupStyle(foregroundColor: MarkupStyleColor(string: self.blockquoteColor))
+      })
+      .add(HTMLTagClassAttribute(className: "mtable") {
+        MarkupStyle(font: MarkupStyleFont(size: basePt))
+      })
+
+    return builder.build()
+  }
+
   private func generateAttributedString(_ htmlBody: String) -> NSAttributedString? {
-    if let httpData = self.generateHtml(htmlBody).data(using: .utf8) {
+    switch self.htmlRenderer {
+    case .webKit:
+      // WARNING: NSHTMLReader._loadUsingWebKit spins a nested run loop that can cause
+      // reentrancy crashes in UITableView._updateVisibleCellsNow:.
+      // Not safe to use during cell configuration in UITableView.
+      if let httpData = self.generateHtml(htmlBody).data(using: .utf8) {
         if #available(iOS 18.0, *) {
-            return try? NSAttributedString(data: httpData,
-                                           options: [.documentType: NSAttributedString.DocumentType.html,
-                                                     .characterEncoding: String.Encoding.utf8.rawValue,
-                                                     .textKit1ListMarkerFormatDocumentOption: true],
-                                           documentAttributes: nil)
+          return try? NSAttributedString(data: httpData,
+                                         options: [.documentType: NSAttributedString.DocumentType.html,
+                                                   .characterEncoding: String.Encoding.utf8.rawValue,
+                                                   .textKit1ListMarkerFormatDocumentOption: true],
+                                         documentAttributes: nil)
         } else {
-            return try? NSAttributedString(data: httpData,
-                                           options: [.documentType: NSAttributedString.DocumentType.html,
-                                                     .characterEncoding: String.Encoding.utf8.rawValue],
-                                           documentAttributes: nil)
+          return try? NSAttributedString(data: httpData,
+                                         options: [.documentType: NSAttributedString.DocumentType.html,
+                                                   .characterEncoding: String.Encoding.utf8.rawValue],
+                                         documentAttributes: nil)
         }
-    } else {
+      }
       return nil
+    case .zMarkupParser:
+      return self.zHTMLParser.render(htmlBody)
     }
   }
   
