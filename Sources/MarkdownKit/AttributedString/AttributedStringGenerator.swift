@@ -62,19 +62,61 @@ open class AttributedStringGenerator {
             if case .block(.listItem(_, _, _), _) = parent { return true }
             return false
           }()
+          let nestingDepth = { () -> Int in
+            var depth = 0
+            var current = parent
+            while case .block(let b, let next) = current {
+              if case .list(_, _, _) = b { depth += 1 }
+              current = next
+            }
+            return depth
+          }()
           let listContent = self.generate(blocks: blocks, parent: .block(block, parent), tight: tight)
           let res: String
           if let startNumber = start {
             res = "<ol start=\"\(startNumber)\">\n" + listContent + "</ol>\n"
           } else if isNested {
-            res = "<ul style=\"list-style-type: circle\">\n" + listContent + "</ul>\n"
+            let bulletStyle: String
+            switch nestingDepth % 2 {
+            case 1:  bulletStyle = "circle"   // ○
+            default: bulletStyle = "disc"     // ●
+            }
+            res = "<ul style=\"list-style-type: \(bulletStyle)\">\n" + listContent + "</ul>\n"
           } else {
             res = "<ul>\n" + listContent + "</ul>\n"
           }
           return isNested ? res : res + "<p style=\"margin: 0;\" />\n"
+        case .listItem(_, _, let blocks):
+          var html = "<li>"
+          for (index, innerBlock) in blocks.enumerated() {
+            if case .paragraph(let text) = innerBlock {
+              if index > 0 {
+                html += "<br/>"
+              }
+              html += self.generate(text: text) + "\n"
+            } else if case .blockquote(let quoteBlocks) = innerBlock {
+              // Render blockquote content inline with italic styling instead of
+              // block-level <blockquote> to avoid line break after bullet
+              if index > 0 {
+                html += "<br/>"
+              }
+              for (qi, quoteBlock) in quoteBlocks.enumerated() {
+                if qi > 0 { html += "<br/>" }
+                if case .paragraph(let text) = quoteBlock {
+                  html += "<em>" + self.generate(text: text) + "</em>"
+                } else {
+                  html += self.generate(block: quoteBlock, parent: .block(block, parent), tight: true)
+                }
+              }
+              html += "\n"
+            } else {
+              html += self.generate(block: innerBlock, parent: .block(block, parent), tight: false)
+            }
+          }
+          html += "</li>\n"
+          return html
         case .paragraph(let text):
-          if case .block(.listItem(_, _, _), .block(.list(_, let tight, _), _)) = parent,
-             tight || self.outer.options.contains(.tightLists) {
+          if case .block(.listItem(_, _, _), .block(.list(_, let tight, _), _)) = parent, tight {
             return self.generate(text: text) + "\n"
           } else {
             return "<p>" + self.generate(text: text) + "</p>\n"
@@ -182,6 +224,10 @@ open class AttributedStringGenerator {
 
     /// Uses ZMarkupParser (pure Swift, synchronous, no WebKit, no run loop issues).
     case zMarkupParser
+
+    /// Direct AST → NSAttributedString rendering, bypassing HTML entirely.
+    /// Fastest and safest option.
+    case direct
   }
 
   /// Default `AttributedStringGenerator` implementation.
@@ -299,6 +345,9 @@ open class AttributedStringGenerator {
 
   /// Generates an attributed string from the given Markdown document
   open func generate(doc: Block) -> NSAttributedString? {
+    if self.htmlRenderer == .direct {
+      return self.directRenderer.render(doc: doc)
+    }
     return self.generateAttributedString(self.htmlGenerator.generate(doc: doc))
   }
 
@@ -509,9 +558,40 @@ open class AttributedStringGenerator {
         .replacingOccurrences(of: "</?html[^>]*>", with: "", options: [.regularExpression, .caseInsensitive])
         .replacingOccurrences(of: "</?body[^>]*>", with: "", options: [.regularExpression, .caseInsensitive])
       return self.zHTMLParser.render(stripped)
+    case .direct:
+        return nil
     }
   }
   
+  /// Custom fragment handler injected from the app layer for direct rendering.
+  public var directCustomFragmentHandler: DirectAttributedStringRenderer.CustomFragmentHandler?
+
+  private lazy var directRenderer: DirectAttributedStringRenderer = {
+    var renderer = DirectAttributedStringRenderer(
+      fontSize: self.fontSize,
+      fontFamily: self.fontFamily.components(separatedBy: ",").first?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) ?? "Helvetica Neue",
+      fontColor: self.fontColor,
+      codeFontSize: self.codeFontSize,
+      codeFontFamily: self.codeFontFamily.components(separatedBy: ",").first?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) ?? "Courier New",
+      codeFontColor: self.codeFontColor,
+      codeBlockFontSize: self.codeBlockFontSize,
+      codeBlockFontColor: self.codeBlockFontColor,
+      codeBlockBackground: self.codeBlockBackground,
+      borderColor: self.borderColor,
+      blockquoteColor: self.blockquoteColor,
+      h1Color: self.h1Color,
+      h2Color: self.h2Color,
+      h3Color: self.h3Color,
+      h4Color: self.h4Color
+    )
+    renderer.customFragmentHandler = self.directCustomFragmentHandler
+    return renderer
+  }()
+
   open var htmlGenerator: HtmlGenerator {
     return InternalHtmlGenerator(outer: self)
   }
@@ -669,7 +749,7 @@ open class AttributedStringGenerator {
   }
   
   open var tableHeaderStyle: String {
-    return "border-top: 1px solid #888;"
+    return ""
   }
   
   open var tableCellPadding: Int {
