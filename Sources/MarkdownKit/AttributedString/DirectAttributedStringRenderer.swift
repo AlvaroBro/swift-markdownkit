@@ -35,6 +35,10 @@ open class DirectAttributedStringRenderer {
     let h3SpacingBefore: CGFloat; let h3SpacingAfter: CGFloat
     let h4Font: UIFont; let h4Color: UIColor
     let h4SpacingBefore: CGFloat; let h4SpacingAfter: CGFloat
+    let h5Font: UIFont; let h5Color: UIColor
+    let h5SpacingBefore: CGFloat; let h5SpacingAfter: CGFloat
+    let h6Font: UIFont; let h6Color: UIColor
+    let h6SpacingBefore: CGFloat; let h6SpacingAfter: CGFloat
 
     let codeFont: UIFont
     let codeFontColor: UIColor
@@ -113,6 +117,16 @@ open class DirectAttributedStringRenderer {
       self.h4Font = UIFont(name: "\(fontFamily) Bold", size: h4Pt) ?? UIFont.boldSystemFont(ofSize: h4Pt)
       self.h4Color = UIColor(hex: h4Color) ?? .black
       self.h4SpacingBefore = 0; self.h4SpacingAfter = h4Pt * 0.2
+
+      // H5: same size as base text, bold
+      self.h5Font = UIFont(name: "\(fontFamily) Bold", size: basePt) ?? UIFont.boldSystemFont(ofSize: basePt)
+      self.h5Color = UIColor(hex: h4Color) ?? .black
+      self.h5SpacingBefore = 0; self.h5SpacingAfter = basePt * 0.15
+
+      // H6: same size as base text, bold (same as H5 but with less spacing)
+      self.h6Font = UIFont(name: "\(fontFamily) Bold", size: basePt) ?? UIFont.boldSystemFont(ofSize: basePt)
+      self.h6Color = UIColor(hex: h4Color) ?? .black
+      self.h6SpacingBefore = 0; self.h6SpacingAfter = basePt * 0.1
 
       // Code
       self.codeFont = UIFont(name: codeFontFamily, size: codePt) ?? UIFont.monospacedSystemFont(ofSize: codePt, weight: .regular)
@@ -310,7 +324,7 @@ open class DirectAttributedStringRenderer {
   // MARK: - Heading
 
   private func renderHeading(level: Int, text: Text, context: RenderContext) -> NSMutableAttributedString {
-    let clampedLevel = max(1, min(level, 4))
+    let clampedLevel = max(1, min(level, 6))
     let font: UIFont
     let color: UIColor
     let spacingBefore: CGFloat
@@ -326,9 +340,15 @@ open class DirectAttributedStringRenderer {
     case 3:
       font = config.h3Font; color = config.h3Color
       spacingBefore = config.h3SpacingBefore; spacingAfter = config.h3SpacingAfter
-    default:
+    case 4:
       font = config.h4Font; color = config.h4Color
       spacingBefore = config.h4SpacingBefore; spacingAfter = config.h4SpacingAfter
+    case 5:
+      font = config.h5Font; color = config.h5Color
+      spacingBefore = config.h5SpacingBefore; spacingAfter = config.h5SpacingAfter
+    default:
+      font = config.h6Font; color = config.h6Color
+      spacingBefore = config.h6SpacingBefore; spacingAfter = config.h6SpacingAfter
     }
 
     let attrs: [NSAttributedString.Key: Any] = [
@@ -391,14 +411,35 @@ open class DirectAttributedStringRenderer {
     let bulletChar: String
     switch type {
     case .bullet:
-      bulletChar = (depth % 2 == 1) ? "\u{2022}" : "\u{25E6}"
+      // Level 1: disc ●, level 2: circle ○, level 3+: small square ▪
+      if depth <= 1 {
+        bulletChar = "\u{2022}"   // ● disc
+      } else if depth == 2 {
+        bulletChar = "\u{25E6}"   // ○ circle
+      } else {
+        bulletChar = "\u{2219}"   // ∙ bullet operator (smaller than •)
+      }
     case .ordered:
       bulletChar = "\(context.orderedListCounter)."
     }
     let marker = "\t\(bulletChar)\t"
 
-    // Simple linear indentation: 36pt per nesting level
-    let headIndent: CGFloat = 36.0 * CGFloat(depth)
+    // Diminishing indentation: full indent for first levels, progressively less for deeper ones.
+    // This prevents deeply nested lists from overflowing the available width.
+    // Levels 1-3: 36pt each, level 4: 24pt, level 5+: 16pt each, capped at 180pt total.
+    let headIndent: CGFloat = {
+      var indent: CGFloat = 0
+      for level in 1...depth {
+        if level <= 3 {
+          indent += 36
+        } else if level == 4 {
+          indent += 24
+        } else {
+          indent += 16
+        }
+      }
+      return min(indent, 180)
+    }()
 
     // Paragraph style for list item — .left matches WebKit's NSTextList behavior
     let paraStyle = makeParagraphStyle(alignment: .left)
